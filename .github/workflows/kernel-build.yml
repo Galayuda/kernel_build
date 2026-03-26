@@ -1,0 +1,281 @@
+# ============================================================================
+# GitHub Actions Workflow для сборки ядра Linux 6.18.9
+# Репозиторий: kernel_build
+# ============================================================================
+
+name: Build Linux Kernel 6.18.9-build
+
+# Триггеры запуска
+on:
+  # Запуск вручную через вкладку Actions
+  workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: 'Версия ядра'
+        required: false
+        default: '6.18.9'
+
+      config_type:
+        description: 'Тип конфигурации (defconfig или custom)'
+        required: false
+        default: 'custom'
+        type: choice
+        options:
+          - custom
+          - defconfig
+
+# Основная задача
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ============================================================================
+      # ШАГ 1: Checkout репозитория
+      # ============================================================================
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ============================================================================
+      # ШАГ 2: Установка зависимостей
+      # ============================================================================
+      - name: Install build dependencies
+        run: |
+          echo "🔧 Установка зависимостей для сборки ядра..."
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            libncurses-dev \
+            bison \
+            flex \
+            libssl-dev \
+            libelf-dev \
+            bc \
+            cpio \
+            dwarves \
+            wget \
+            git \
+            kmod
+          echo "✅ Зависимости установлены"
+
+      # ============================================================================
+      # ШАГ 3: Загрузка исходников ядра
+      # ============================================================================
+      - name: Download kernel source
+        run: |
+          echo "📥 Загрузка исходников ядра..."
+          KERNEL_VERSION="${{ github.event.inputs.kernel_version || '6.18.9' }}"
+          wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${KERNEL_VERSION}.tar.xz
+          tar -xf linux-${KERNEL_VERSION}.tar.xz
+          mv linux-${KERNEL_VERSION} linux-build
+          echo "✅ Исходники загружены: linux-${KERNEL_VERSION}"
+          ls -lh
+
+      # ============================================================================
+      # ШАГ 4: Копирование конфигурации + сохранение для артефакта
+      # ============================================================================
+      - name: Copy kernel config
+        id: copy_config
+        run: |
+          echo "📋 Копирование конфигурации..."
+          CONFIG_TYPE="${{ github.event.inputs.config_type || 'custom' }}"
+
+          # Переходим в папку с исходниками
+          cd linux-build
+
+          if [ "$CONFIG_TYPE" = "custom" ]; then
+            # Используем наш config_kernel из репозитория
+            if [ -f "$GITHUB_WORKSPACE/config_kernel" ]; then
+              cp "$GITHUB_WORKSPACE/config_kernel" .config
+              echo "✅ Использована config_kernel из репозитория"
+            else
+              echo "⚠️ config_kernel не найдена, создаём defconfig"
+              make defconfig
+            fi
+          else
+            # Создаём дефолтную конфигурацию
+            make defconfig
+            echo "✅ Создана defconfig"
+          fi
+
+          # 🔥 КРИТИЧНО: Сохраняем копию .config СРАЗУ (до сборки)
+          cp .config "$GITHUB_WORKSPACE/config_kernel"
+          echo "✅ .config сохранена в \$GITHUB_WORKSPACE/config_kernel"
+
+          # Показываем ключевые опции
+          echo ""
+          echo "📊 Ключевые опции конфигурации:"
+          grep -E "^CONFIG_(IWLWIFI|SND_HDA|DRM_I915|PREEMPT|LOCALVERSION)=" .config | head -10
+
+      # ============================================================================
+      # ШАГ 5: Подготовка к сборке
+      # ============================================================================
+      - name: Prepare kernel build
+        run: |
+          echo "🔧 Подготовка к сборке..."
+          cd linux-build
+
+          # Генерация заголовков
+          make prepare
+          make scripts
+
+          echo "✅ Подготовка завершена"
+
+      # ============================================================================
+      # ШАГ 6: Сборка ядра
+      # ============================================================================
+      - name: Build kernel
+        run: |
+          echo "🚀 Начало сборки ядра..."
+          cd linux-build
+
+          # Получаем количество доступных CPU
+          CPU_COUNT=$(nproc)
+          echo "📊 Доступно CPU: $CPU_COUNT"
+
+          # Замер времени
+          START_TIME=$(date +%s)
+
+          # Сборка bzImage и модулей
+          make -j$CPU_COUNT bzImage modules 2>&1 | tail -50
+
+          # Время сборки
+          END_TIME=$(date +%s)
+          ELAPSED=$((END_TIME - START_TIME))
+          MINUTES=$((ELAPSED / 60))
+          SECONDS=$((ELAPSED % 60))
+
+          echo ""
+          echo "⏱️ Время сборки: ${MINUTES}м ${SECONDS}с"
+          echo "✅ Сборка завершена!"
+
+      # ============================================================================
+      # ШАГ 7: Проверка результатов (БЕЗ ПРОВЕРКИ МОДУЛЕЙ)
+      # ============================================================================
+      - name: Check build results
+        run: |
+          echo "📊 Проверка результатов..."
+          cd linux-build
+
+          # Размер ядра
+          echo ""
+          echo "📦 Размер bzImage:"
+          ls -lh arch/x86/boot/bzImage
+
+          # Версия ядра
+          echo ""
+          echo "🏷️ Версия ядра:"
+          cat include/config/kernel.release
+
+          # Статистика конфигурации
+          echo ""
+          echo "📊 Статистика конфигурации:"
+          scripts/config --list-missing 2>/dev/null | head -20 || echo "Все опции доступны"
+
+          # Проверяем что критические модули собрались (после установки)
+          echo ""
+          echo "✅ Ядро собрано успешно"
+
+      # ============================================================================
+      # ШАГ 8: Установка модулей
+      # ============================================================================
+      - name: Install modules
+        run: |
+          echo "📦 Установка модулей..."
+          cd linux-build
+
+          # Получаем версию ядра из .config
+          KERNEL_RELEASE=$(cat include/config/kernel.release)
+          echo "🏷️ Версия ядра: $KERNEL_RELEASE"
+
+          # Устанавливаем модули напрямую в папку версии (без lib/modules обёртки)
+          mkdir -p modules_install/$KERNEL_RELEASE
+          make INSTALL_MOD_PATH=modules_install/$KERNEL_RELEASE modules_install
+
+          # ⚠️ КРИТИЧНО: Удаляем build/ из модулей (это симлинк на исходники!)
+          echo ""
+          echo "🗑️ Удаление build/ директории из модулей..."
+          rm -rf modules_install/$KERNEL_RELEASE/build
+          echo "✅ build/ удалён"
+
+          echo "✅ Модули установлены"
+          echo ""
+          echo "📊 Размер модулей (после очистки):"
+          du -sh modules_install/$KERNEL_RELEASE
+
+          # Показываем содержимое
+          echo ""
+          echo "📁 Содержимое:"
+          ls -lh modules_install/$KERNEL_RELEASE
+
+          # 🔥 ПРОВЕРКА КРИТИЧЕСКИХ МОДУЛЕЙ (ПОСЛЕ УСТАНОВКИ)
+          echo ""
+          echo "🎵 Проверка модулей звука HDA:"
+          find modules_install/$KERNEL_RELEASE -name "snd-hda-intel.ko*" -type f 2>/dev/null | head -3 || echo "Модуль не найден"
+
+          echo ""
+          echo "🎵 Проверка модулей i915:"
+          find modules_install/$KERNEL_RELEASE -name "i915.ko*" -type f 2>/dev/null | head -3 || echo "Модуль не найден"
+
+          echo ""
+          echo "📡 Проверка модулей WiFi:"
+          find modules_install/$KERNEL_RELEASE -name "iwlwifi.ko*" -type f 2>/dev/null | head -3 || echo "Модуль не найден"
+
+      # ============================================================================
+      # ШАГ 9: Загрузка артефактов
+      # ============================================================================
+      - name: Get kernel release version
+        id: kernel_release
+        run: |
+          # 🔥 Читаем реальную версию ядра из kernel.release
+          KERNEL_RELEASE=$(cat include/config/kernel.release)
+          echo "kernel_release=$KERNEL_RELEASE" >> $GITHUB_OUTPUT
+          echo "📊 Kernel release: $KERNEL_RELEASE"
+        working-directory: linux-build
+
+      - name: Upload kernel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bzImage-${{ github.event.inputs.kernel_version || '6.18.9' }}
+          path: linux-build/arch/x86/boot/bzImage
+          retention-days: 30
+
+      - name: Upload config artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: config-${{ github.event.inputs.kernel_version || '6.18.9' }}
+          path: ${{ github.workspace }}/config_kernel
+          retention-days: 30
+          if-no-files-found: error
+          include-hidden-files: true
+
+      - name: Upload modules artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: modules-${{ steps.kernel_release.outputs.kernel_release }}
+          path: |
+            linux-build/modules_install/${{ steps.kernel_release.outputs.kernel_release }}/lib/modules/${{ steps.kernel_release.outputs.kernel_release }}/
+            !linux-build/modules_install/${{ steps.kernel_release.outputs.kernel_release }}/lib/modules/${{ steps.kernel_release.outputs.kernel_release }}/build/**
+          retention-days: 30
+          if-no-files-found: error
+
+      # ============================================================================
+      # ШАГ 10: Финальное сообщение
+      # ============================================================================
+      - name: Build summary
+        run: |
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════╗"
+          echo "║              СБОРКА ЯДРА ЗАВЕРШЕНА! ✅                   ║"
+          echo "╚══════════════════════════════════════════════════════════╝"
+          echo ""
+          echo "📦 Артефакты доступны для скачивания:"
+          echo "   - bzImage (образ ядра)"
+          echo "   - .config (конфигурация)"
+          echo "   - modules (модули)"
+          echo ""
+          echo "⏱️ Для скачивания:"
+          echo "   1. Вернитесь на страницу Actions"
+          echo "   2. Откройте этот запуск"
+          echo "   3. В разделе 'Artifacts' скачайте нужные файлы"
+          echo ""
