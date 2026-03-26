@@ -64,7 +64,7 @@ jobs:
       - name: Download kernel source
         run: |
           echo "📥 Загрузка исходников ядра..."
-          KERNEL_VERSION="${{ github.event.inputs.kernel_version || '6.18.9' }}"
+          KERNEL_VERSION="${{ github.event.inputs.kernel_version || '6.19.10' }}"
           wget -q https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${KERNEL_VERSION}.tar.xz
           tar -xf linux-${KERNEL_VERSION}.tar.xz
           mv linux-${KERNEL_VERSION} linux-build
@@ -236,14 +236,14 @@ jobs:
       - name: Upload kernel artifact
         uses: actions/upload-artifact@v4
         with:
-          name: bzImage-${{ github.event.inputs.kernel_version || '6.18.9' }}
+          name: bzImage-${{ github.event.inputs.kernel_version || '6.19.10' }}
           path: linux-build/arch/x86/boot/bzImage
           retention-days: 30
 
       - name: Upload config artifact
         uses: actions/upload-artifact@v4
         with:
-          name: config-${{ github.event.inputs.kernel_version || '6.18.9' }}
+          name: config-${{ github.event.inputs.kernel_version || '6.19.10' }}
           path: ${{ github.workspace }}/config_kernel
           retention-days: 30
           if-no-files-found: error
