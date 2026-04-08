@@ -144,11 +144,11 @@ jobs:
           echo "✅ Подготовка завершена"
 
       # ============================================================================
-      # ШАГ 7: Сборка ядра + ПОЛНЫЙ ЛОГ модулей
+      # ШАГ 7: Сборка ядра (vmlinux) — полная сборка built-in объектов
       # ============================================================================
-      - name: Build kernel
+      - name: Build kernel (vmlinux)
         run: |
-          echo "🚀 Начало сборки ядра..."
+          echo "🚀 Начало сборки ядра (vmlinux)..."
           cd linux-build
 
           # Получаем количество доступных CPU
@@ -158,14 +158,10 @@ jobs:
           # Замер времени
           START_TIME=$(date +%s)
 
-          # Сборка bzImage — обычный вывод
-          echo "📦 Сборка bzImage..."
-          make -j$CPU_COUNT bzImage
-
-          # Сборка модулей — ПОЛНЫЙ ЛОГ (не tail!)
-          echo ""
-          echo "📦 Сборка модулей (полный лог)..."
-          make -j$CPU_COUNT modules 2>&1 | tee /tmp/modules_build.log
+          # ПОЛНАЯ СБОРКА ЯДРА: компилирует ВСЕ built-in объекты (CONFIG_*=y)
+          # включая fs/fuse/backing.o при CONFIG_FUSE_PASSTHROUGH=y
+          echo "📦 Сборка vmlinux..."
+          make -j$CPU_COUNT vmlinux 2>&1 | tee /tmp/kernel_build.log
 
           # Время сборки
           END_TIME=$(date +%s)
@@ -174,11 +170,62 @@ jobs:
           SECONDS=$((ELAPSED % 60))
 
           echo ""
-          echo "⏱️ Время сборки: ${MINUTES}м ${SECONDS}с"
-          echo "✅ Сборка завершена!"
+          echo "⏱️ Время сборки ядра: ${MINUTES}м ${SECONDS}с"
+          echo "✅ Сборка ядра завершена!"
 
       # ============================================================================
-      # ШАГ 8: Проверка результатов
+      # ШАГ 8: Сборка модулей (CONFIG_*=m)
+      # ============================================================================
+      - name: Build modules
+        run: |
+          echo "📦 Начало сборки модулей..."
+          cd linux-build
+
+          CPU_COUNT=$(nproc)
+          START_TIME=$(date +%s)
+
+          # Сборка только модулей (CONFIG_*=m)
+          make -j$CPU_COUNT modules 2>&1 | tee /tmp/modules_build.log
+
+          END_TIME=$(date +%s)
+          ELAPSED=$((END_TIME - START_TIME))
+          MINUTES=$((ELAPSED / 60))
+          SECONDS=$((ELAPSED % 60))
+
+          echo ""
+          echo "⏱️ Время сборки модулей: ${MINUTES}м ${SECONDS}с"
+          echo "✅ Сборка модулей завершена!"
+
+      # ============================================================================
+      # ШАГ 9: Создание bzImage из собранного vmlinux
+      # ============================================================================
+      - name: Create bzImage
+        run: |
+          echo "📦 Создание bzImage..."
+          cd linux-build
+
+          # bzImage создаётся из уже собранного vmlinux (быстро)
+          make bzImage 2>&1 | tee /tmp/bzimage_build.log
+
+          echo "✅ bzImage создан"
+          ls -lh arch/x86/boot/bzImage
+
+      # ============================================================================
+      # ШАГ 10: Установка заголовков (headers)
+      # ============================================================================
+      - name: Install headers
+        run: |
+          echo "📦 Установка заголовков..."
+          cd linux-build
+
+          # Установка заголовков для user-space (нужно для сборки fuse и др.)
+          make headers_install INSTALL_HDR_PATH=headers 2>&1 | tee /tmp/headers_install.log
+
+          echo "✅ Заголовки установлены"
+          ls headers/include/ | head -10
+
+      # ============================================================================
+      # ШАГ 11: Проверка результатов
       # ============================================================================
       - name: Check build results
         run: |
@@ -186,6 +233,10 @@ jobs:
           cd linux-build
 
           # Размер ядра
+          echo ""
+          echo "📦 Размер vmlinux:"
+          ls -lh vmlinux
+
           echo ""
           echo "📦 Размер bzImage:"
           ls -lh arch/x86/boot/bzImage
@@ -200,11 +251,16 @@ jobs:
           echo "📊 Статистика конфигурации:"
           scripts/config --list-missing 2>/dev/null | head -20 || echo "Все опции доступны"
 
+          # Проверка что vmlinux содержит нужные символы
+          echo ""
+          echo "🔍 Проверка экспортируемых символов (backing_file_*):"
+          nm vmlinux 2>/dev/null | grep -i "backing_file" | head -10 || echo "⚠️ vmlinux не содержит отладочных символов (нормально)"
+
           echo ""
           echo "✅ Ядро собрано успешно"
 
       # ============================================================================
-      # ШАГ 9: Установка модулей
+      # ШАГ 12: Установка модулей
       # ============================================================================
       - name: Install modules
         run: |
@@ -216,8 +272,10 @@ jobs:
           echo "🏷️ Версия ядра: $KERNEL_RELEASE"
 
           # Устанавливаем модули
+          # ВАЖНО: modules_install генерирует modules.builtin, modules.builtin.modinfo
+          # только если была полная сборка ядра (vmlinux), а не только bzImage
           mkdir -p modules_install/$KERNEL_RELEASE
-          make INSTALL_MOD_PATH=modules_install/$KERNEL_RELEASE modules_install
+          make INSTALL_MOD_PATH=modules_install/$KERNEL_RELEASE modules_install 2>&1 | tee /tmp/modules_install.log
 
           # Удаляем build/ (симлинк на исходники)
           echo ""
@@ -231,7 +289,7 @@ jobs:
           du -sh modules_install/$KERNEL_RELEASE
 
       # ============================================================================
-      # ШАГ 10: Загрузка артефактов
+      # ШАГ 13: Загрузка артефактов
       # ============================================================================
       - name: Get kernel release version
         id: kernel_release
@@ -241,12 +299,20 @@ jobs:
           echo "📊 Kernel release: $KERNEL_RELEASE"
         working-directory: linux-build
 
-      - name: Upload kernel artifact
+      - name: Upload kernel artifact (bzImage)
         uses: actions/upload-artifact@v4
         with:
           name: bzImage-${{ github.event.inputs.kernel_version || '6.19.10' }}
           path: linux-build/arch/x86/boot/bzImage
           retention-days: 30
+
+      - name: Upload vmlinux artifact (optional, debug)
+        uses: actions/upload-artifact@v4
+        with:
+          name: vmlinux-${{ github.event.inputs.kernel_version || '6.19.10' }}
+          path: linux-build/vmlinux
+          retention-days: 30
+          if-no-files-found: warn
 
       - name: Upload config artifact (original)
         uses: actions/upload-artifact@v4
@@ -264,12 +330,16 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
-      - name: Upload modules build log
+      - name: Upload build logs
         uses: actions/upload-artifact@v4
         with:
           name: build-logs
           path: |
+            /tmp/kernel_build.log
             /tmp/modules_build.log
+            /tmp/bzimage_build.log
+            /tmp/modules_install.log
+            /tmp/headers_install.log
             /tmp/olddefconfig.log
             /tmp/prepare.log
             /tmp/scripts.log
@@ -286,8 +356,16 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
+      - name: Upload headers artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: headers-${{ github.event.inputs.kernel_version || '6.19.10' }}
+          path: linux-build/headers/
+          retention-days: 30
+          if-no-files-found: warn
+
       # ============================================================================
-      # ШАГ 11: Финальное сообщение
+      # ШАГ 14: Финальное сообщение
       # ============================================================================
       - name: Build summary
         run: |
@@ -297,11 +375,13 @@ jobs:
           echo "╚══════════════════════════════════════════════════════════╝"
           echo ""
           echo "📦 Артефакты доступны для скачивания:"
-          echo "   - bzImage (образ ядра)"
+          echo "   - bzImage (образ ядра для загрузки)"
+          echo "   - vmlinux (неотжатое ядро для отладки)"
           echo "   - config-original (конфиг до olddefconfig)"
           echo "   - config-after-olddefconfig (конфиг после olddefconfig)"
-          echo "   - build-logs (логи сборки)"
-          echo "   - modules (модули ядра)"
+          echo "   - build-logs (полные логи сборки)"
+          echo "   - modules (модули ядра + modules.builtin)"
+          echo "   - headers (заголовки для user-space)"
           echo ""
           echo "⏱️ Для скачивания:"
           echo "   1. Вернитесь на страницу Actions"
