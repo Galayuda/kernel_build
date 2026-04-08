@@ -1,6 +1,7 @@
 # ============================================================================
-# GitHub Actions Workflow для сборки ядра Linux 6.19.10
+# GitHub Actions Workflow для сборки ядра Linux 6.19.10-build
 # Репозиторий: kernel_build
+# Конфигурация: config_kernel
 # ============================================================================
 
 name: Build Linux Kernel 6.19.10-build
@@ -89,7 +90,7 @@ jobs:
               cp "$GITHUB_WORKSPACE/config_kernel" .config
               echo "✅ Использована config_kernel из репозитория"
             else
-              echo "⚠️ config_kernel не найдена, создаём defconfig"
+              echo "⚠️ config_kernel не найден, создаём defconfig"
               make defconfig
             fi
           else
@@ -99,16 +100,37 @@ jobs:
           fi
 
           # 🔥 КРИТИЧНО: Сохраняем копию .config СРАЗУ (до сборки)
-          cp .config "$GITHUB_WORKSPACE/config_kernel"
-          echo "✅ .config сохранена в \$GITHUB_WORKSPACE/config_kernel"
+          cp .config "$GITHUB_WORKSPACE/config_kernel_original"
+          echo "✅ .config сохранена в \$GITHUB_WORKSPACE/config_kernel_original"
 
           # Показываем ключевые опции
           echo ""
           echo "📊 Ключевые опции конфигурации:"
-          grep -E "^CONFIG_(IWLWIFI|SND_HDA|DRM_I915|PREEMPT|LOCALVERSION)=" .config | head -10
+          grep -E "^CONFIG_(IWLWIFI|SND_HDA|DRM_I915|PREEMPT|LOCALVERSION|FUSE_FS)=" .config | head -10
 
       # ============================================================================
-      # ШАГ 5: Подготовка к сборке
+      # ШАГ 5: olddefconfig — разрешение зависимостей + лог предупреждений
+      # ============================================================================
+      - name: Resolve config dependencies
+        run: |
+          echo "🔧 Разрешение зависимостей конфигурации..."
+          cd linux-build
+
+          # olddefconfig автоматически разрешает зависимости и отключает невозможное
+          make olddefconfig 2>&1 | tee /tmp/olddefconfig.log
+
+          # Показываем что изменилось
+          echo ""
+          echo "📊 Ключевые опции ПОСЛЕ olddefconfig:"
+          grep -E "^CONFIG_(IWLWIFI|IWLMVM|CFG80211|MAC80211|FUSE_FS|CUSE|LOCALVERSION)=" .config
+
+          # Сохраняем финальный конфиг для анализа
+          cp .config "$GITHUB_WORKSPACE/config_kernel_final"
+
+          echo "✅ Конфигурация разрешена"
+
+      # ============================================================================
+      # ШАГ 6: Подготовка к сборке
       # ============================================================================
       - name: Prepare kernel build
         run: |
@@ -116,13 +138,13 @@ jobs:
           cd linux-build
 
           # Генерация заголовков
-          make prepare
-          make scripts
+          make prepare 2>&1 | tee /tmp/prepare.log
+          make scripts 2>&1 | tee /tmp/scripts.log
 
           echo "✅ Подготовка завершена"
 
       # ============================================================================
-      # ШАГ 6: Сборка ядра
+      # ШАГ 7: Сборка ядра + ПОЛНЫЙ ЛОГ модулей
       # ============================================================================
       - name: Build kernel
         run: |
@@ -136,8 +158,14 @@ jobs:
           # Замер времени
           START_TIME=$(date +%s)
 
-          # Сборка bzImage и модулей
-          make -j$CPU_COUNT bzImage modules 2>&1 | tail -50
+          # Сборка bzImage — обычный вывод
+          echo "📦 Сборка bzImage..."
+          make -j$CPU_COUNT bzImage
+
+          # Сборка модулей — ПОЛНЫЙ ЛОГ (не tail!)
+          echo ""
+          echo "📦 Сборка модулей (полный лог)..."
+          make -j$CPU_COUNT modules 2>&1 | tee /tmp/modules_build.log
 
           # Время сборки
           END_TIME=$(date +%s)
@@ -150,7 +178,7 @@ jobs:
           echo "✅ Сборка завершена!"
 
       # ============================================================================
-      # ШАГ 7: Проверка результатов (БЕЗ ПРОВЕРКИ МОДУЛЕЙ)
+      # ШАГ 8: Проверка результатов
       # ============================================================================
       - name: Check build results
         run: |
@@ -172,12 +200,11 @@ jobs:
           echo "📊 Статистика конфигурации:"
           scripts/config --list-missing 2>/dev/null | head -20 || echo "Все опции доступны"
 
-          # Проверяем что критические модули собрались (после установки)
           echo ""
           echo "✅ Ядро собрано успешно"
 
       # ============================================================================
-      # ШАГ 8: Установка модулей
+      # ШАГ 9: Установка модулей
       # ============================================================================
       - name: Install modules
         run: |
@@ -188,11 +215,11 @@ jobs:
           KERNEL_RELEASE=$(cat include/config/kernel.release)
           echo "🏷️ Версия ядра: $KERNEL_RELEASE"
 
-          # Устанавливаем модули напрямую в папку версии (без lib/modules обёртки)
+          # Устанавливаем модули
           mkdir -p modules_install/$KERNEL_RELEASE
           make INSTALL_MOD_PATH=modules_install/$KERNEL_RELEASE modules_install
 
-          # ⚠️ КРИТИЧНО: Удаляем build/ из модулей (это симлинк на исходники!)
+          # Удаляем build/ (симлинк на исходники)
           echo ""
           echo "🗑️ Удаление build/ директории из модулей..."
           rm -rf modules_install/$KERNEL_RELEASE/build
@@ -203,31 +230,12 @@ jobs:
           echo "📊 Размер модулей (после очистки):"
           du -sh modules_install/$KERNEL_RELEASE
 
-          # Показываем содержимое
-          echo ""
-          echo "📁 Содержимое:"
-          ls -lh modules_install/$KERNEL_RELEASE
-
-          # 🔥 ПРОВЕРКА КРИТИЧЕСКИХ МОДУЛЕЙ (ПОСЛЕ УСТАНОВКИ)
-          echo ""
-          echo "🎵 Проверка модулей звука HDA:"
-          find modules_install/$KERNEL_RELEASE -name "snd-hda-intel.ko*" -type f 2>/dev/null | head -3 || echo "Модуль не найден"
-
-          echo ""
-          echo "🎵 Проверка модулей i915:"
-          find modules_install/$KERNEL_RELEASE -name "i915.ko*" -type f 2>/dev/null | head -3 || echo "Модуль не найден"
-
-          echo ""
-          echo "📡 Проверка модулей WiFi:"
-          find modules_install/$KERNEL_RELEASE -name "iwlwifi.ko*" -type f 2>/dev/null | head -3 || echo "Модуль не найден"
-
       # ============================================================================
-      # ШАГ 9: Загрузка артефактов
+      # ШАГ 10: Загрузка артефактов
       # ============================================================================
       - name: Get kernel release version
         id: kernel_release
         run: |
-          # 🔥 Читаем реальную версию ядра из kernel.release
           KERNEL_RELEASE=$(cat include/config/kernel.release)
           echo "kernel_release=$KERNEL_RELEASE" >> $GITHUB_OUTPUT
           echo "📊 Kernel release: $KERNEL_RELEASE"
@@ -240,14 +248,33 @@ jobs:
           path: linux-build/arch/x86/boot/bzImage
           retention-days: 30
 
-      - name: Upload config artifact
+      - name: Upload config artifact (original)
         uses: actions/upload-artifact@v4
         with:
-          name: config-${{ github.event.inputs.kernel_version || '6.19.10' }}
-          path: ${{ github.workspace }}/config_kernel
+          name: config-original
+          path: ${{ github.workspace }}/config_kernel_original
           retention-days: 30
           if-no-files-found: error
-          include-hidden-files: true
+
+      - name: Upload config artifact (after olddefconfig)
+        uses: actions/upload-artifact@v4
+        with:
+          name: config-after-olddefconfig
+          path: ${{ github.workspace }}/config_kernel_final
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload modules build log
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            /tmp/modules_build.log
+            /tmp/olddefconfig.log
+            /tmp/prepare.log
+            /tmp/scripts.log
+          retention-days: 30
+          if-no-files-found: warn
 
       - name: Upload modules artifact
         uses: actions/upload-artifact@v4
@@ -260,7 +287,7 @@ jobs:
           if-no-files-found: error
 
       # ============================================================================
-      # ШАГ 10: Финальное сообщение
+      # ШАГ 11: Финальное сообщение
       # ============================================================================
       - name: Build summary
         run: |
@@ -271,8 +298,10 @@ jobs:
           echo ""
           echo "📦 Артефакты доступны для скачивания:"
           echo "   - bzImage (образ ядра)"
-          echo "   - .config (конфигурация)"
-          echo "   - modules (модули)"
+          echo "   - config-original (конфиг до olddefconfig)"
+          echo "   - config-after-olddefconfig (конфиг после olddefconfig)"
+          echo "   - build-logs (логи сборки)"
+          echo "   - modules (модули ядра)"
           echo ""
           echo "⏱️ Для скачивания:"
           echo "   1. Вернитесь на страницу Actions"
